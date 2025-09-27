@@ -1,0 +1,19 @@
+# 完整公司估值分析系统依赖库
+# 生成时间: 2025-09-27
+
+# 数值计算和数据处理
+numpy>=1.21.0
+pandas>=1.3.0
+
+# 数据可视化
+matplotlib>=3.5.0
+seaborn>=0.11.0
+
+# 金融数据获取
+akshare>=1.10.0
+
+# 科学计算和统计
+scipy>=1.7.0
+
+# 其他标准库依赖（Python内置，无需安装）
+# datetime, warnings, time, random, logging
