@@ -13,6 +13,8 @@ import warnings
 import time
 import random
 import logging
+import os
+import glob
 from scipy import stats
 warnings.filterwarnings('ignore')
 
@@ -82,6 +84,9 @@ class CompleteValuationSystem:
                 else:
                     logger.warning("未找到股票简称信息，使用演示数据")
                     self._create_demo_data()
+                
+                # 尝试获取股息率信息
+                self._load_dividend_yield()
             else:
                 logger.warning("股票信息为空，使用演示数据")
                 self._create_demo_data()
@@ -90,12 +95,61 @@ class CompleteValuationSystem:
             logger.info("使用演示数据继续分析")
             self._create_demo_data()
     
+    def _load_dividend_yield(self):
+        """加载股息率信息"""
+        try:
+            # 尝试从多个数据源获取股息率
+            dividend_yield = None
+            
+            # 方法1: 从实时数据获取
+            try:
+                realtime_data = ak.stock_zh_a_spot_em()
+                if realtime_data is not None and not realtime_data.empty:
+                    stock_data = realtime_data[realtime_data['代码'] == self.stock_code]
+                    if not stock_data.empty:
+                        # 有些数据源可能包含股息率信息
+                        if '股息率' in stock_data.columns:
+                            dividend_yield = stock_data.iloc[0]['股息率']
+                            logger.info(f"从实时数据获取股息率: {dividend_yield}")
+            except Exception as e:
+                logger.warning(f"从实时数据获取股息率失败: {e}")
+            
+            # 方法2: 从财务数据估算
+            if dividend_yield is None and self.financial_data is not None:
+                indicators = self.financial_data.get('indicators')
+                if indicators is not None:
+                    # 如果有每股收益和当前价格，可以估算股息率
+                    eps = indicators.get('基本每股收益', indicators.get('每股收益', 0))
+                    if eps > 0 and self.historical_data is not None:
+                        current_price = self.historical_data['收盘'].iloc[-1]
+                        # 假设分红率为30%
+                        dividend_per_share = eps * 0.3
+                        dividend_yield = dividend_per_share / current_price
+                        logger.info(f"估算股息率: {dividend_yield*100:.2f}%")
+            
+            # 方法3: 使用行业平均股息率
+            if dividend_yield is None:
+                # 使用A股市场平均股息率作为参考
+                dividend_yield = 0.03  # 3%作为默认值
+                logger.info(f"使用默认股息率: {dividend_yield*100:.2f}%")
+            
+            # 将股息率添加到stock_info中
+            if dividend_yield is not None:
+                dividend_row = pd.DataFrame({
+                    'item': ['股息率'],
+                    'value': [f'{dividend_yield*100:.2f}%']
+                })
+                self.stock_info = pd.concat([self.stock_info, dividend_row], ignore_index=True)
+                
+        except Exception as e:
+            logger.warning(f"加载股息率信息失败: {e}")
+    
     def _load_historical_data(self):
         """加载历史价格数据"""
         try:
             logger.info(f"开始加载股票 {self.stock_code} 的历史价格数据")
             end_date = datetime.now().strftime('%Y%m%d')
-            start_date = (datetime.now() - timedelta(days=365)).strftime('%Y%m%d')
+            start_date = (datetime.now() - timedelta(days=730)).strftime('%Y%m%d')
             
             k_data = ak.stock_zh_a_hist(symbol=self.stock_code,
                                       start_date=start_date,
@@ -466,20 +520,43 @@ class CompleteValuationSystem:
                 logger.warning("收益率数据为空，无法执行风险分析")
                 return None
             
-            volatility = returns.std() * np.sqrt(252)
-            sharpe_ratio = returns.mean() / returns.std() * np.sqrt(252) if returns.std() > 0 else 0
-            var_95 = np.percentile(returns, 5)
-            expected_shortfall = returns[returns <= var_95].mean()
+            # 基础风险指标
+            volatility = returns.std() * np.sqrt(252)  # 年化波动率
+            annual_return = returns.mean() * 252  # 年化收益率
+            
+            # 夏普比率
+            sharpe_ratio = annual_return / volatility if volatility > 0 else 0
+            
+            # 最大回撤
             max_drawdown = self._calculate_max_drawdown()
             
-            logger.info(f"风险分析完成: 年化波动率 {volatility*100:.2f}%, 夏普比率 {sharpe_ratio:.2f}, 最大回撤 {max_drawdown*100:.2f}%")
+            # 卡玛比率 (Calmar Ratio)
+            calmar_ratio = annual_return / abs(max_drawdown) if max_drawdown != 0 else 0
+            
+            # 索提诺比率 (Sortino Ratio)
+            sortino_ratio = self._calculate_sortino_ratio(returns)
+            
+            # 信息比率 (Information Ratio)
+            information_ratio = self._calculate_information_ratio(returns)
+            
+            # VaR和条件VaR
+            var_95 = np.percentile(returns, 5)
+            expected_shortfall = returns[returns <= var_95].mean()
+            
+            logger.info(f"风险分析完成: 年化波动率 {volatility*100:.2f}%, 夏普比率 {sharpe_ratio:.2f}")
+            logger.info(f"最大回撤 {max_drawdown*100:.2f}%, 卡玛比率 {calmar_ratio:.2f}")
+            logger.info(f"索提诺比率 {sortino_ratio:.2f}, 信息比率 {information_ratio:.2f}")
             
             return {
                 '年化波动率': volatility,
+                '年化收益率': annual_return,
                 '夏普比率': sharpe_ratio,
+                '最大回撤': max_drawdown,
+                '卡玛比率': calmar_ratio,
+                '索提诺比率': sortino_ratio,
+                '信息比率': information_ratio,
                 '95%VaR': var_95,
-                '条件VaR': expected_shortfall,
-                '最大回撤': max_drawdown
+                '条件VaR': expected_shortfall
             }
         except Exception as e:
             logger.error(f"风险分析失败: {e}")
@@ -496,6 +573,51 @@ class CompleteValuationSystem:
         max_drawdown = drawdown.min()
         
         return max_drawdown
+    
+    def _calculate_sortino_ratio(self, returns, risk_free_rate=0.03):
+        """计算索提诺比率 (Sortino Ratio)"""
+        try:
+            annual_return = returns.mean() * 252
+            downside_returns = returns[returns < 0]
+            
+            if len(downside_returns) == 0:
+                return 0
+                
+            downside_volatility = downside_returns.std() * np.sqrt(252)
+            
+            if downside_volatility > 0:
+                sortino_ratio = (annual_return - risk_free_rate) / downside_volatility
+            else:
+                sortino_ratio = 0
+                
+            return sortino_ratio
+        except Exception as e:
+            logger.warning(f"索提诺比率计算失败: {e}")
+            return 0
+    
+    def _calculate_information_ratio(self, returns, benchmark_returns=None):
+        """计算信息比率 (Information Ratio)"""
+        try:
+            # 如果没有基准收益率，使用市场平均收益率作为基准
+            if benchmark_returns is None:
+                # 使用简单的市场基准假设 (例如年化8%)
+                benchmark_daily_return = 0.08 / 252
+                excess_returns = returns - benchmark_daily_return
+            else:
+                excess_returns = returns - benchmark_returns
+            
+            tracking_error = excess_returns.std() * np.sqrt(252)
+            mean_excess_return = excess_returns.mean() * 252
+            
+            if tracking_error > 0:
+                information_ratio = mean_excess_return / tracking_error
+            else:
+                information_ratio = 0
+                
+            return information_ratio
+        except Exception as e:
+            logger.warning(f"信息比率计算失败: {e}")
+            return 0
     
     def comprehensive_analysis(self):
         """综合估值分析"""
@@ -552,7 +674,7 @@ class CompleteValuationSystem:
         
         if self.stock_info is not None:
             for _, row in self.stock_info.iterrows():
-                if row['item'] in ['股票名称', '行业', '总股本', '市盈率', '市净率']:
+                if row['item'] in ['股票名称', '行业', '总股本', '市盈率', '市净率', '股息率']:
                     print(f"  {row['item']}: {row['value']}")
         
         if self.historical_data is not None:
@@ -570,14 +692,64 @@ class CompleteValuationSystem:
 📊 公司估值分析报告 - {self.company_name} ({self.stock_code})
 ⏰ 分析时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
-💡 估值方法说明:
+📋【公司基本信息】
+"""
+        
+        # 添加股票基本信息
+        if self.stock_info is not None:
+            for _, row in self.stock_info.iterrows():
+                if row['item'] in ['股票名称', '股票简称', '行业', '总股本', '市盈率', '市净率', '所属板块', '股息率']:
+                    report += f"  {row['item']}: {row['value']}\n"
+        
+        # 添加当前价格信息
+        if self.historical_data is not None:
+            current_price = self.historical_data['收盘'].iloc[-1]
+            report += f"  当前价格: {current_price:.2f} 元\n"
+            
+            if len(self.historical_data) >= 20:
+                price_20d_ago = self.historical_data['收盘'].iloc[-20]
+                change_20d = (current_price - price_20d_ago) / price_20d_ago * 100
+                report += f"  20日涨跌幅: {change_20d:+.2f}%\n"
+        
+        # 添加财务数据信息
+        report += "\n💰【财务数据摘要】\n"
+        if self.financial_data is not None:
+            indicators = self.financial_data.get('indicators')
+            if indicators is not None:
+                financial_metrics = {
+                    '营业总收入': '营业收入',
+                    '归母净利润': '归母净利润',
+                    '净利润': '净利润',
+                    '总资产': '总资产',
+                    '净资产': '净资产',
+                    '基本每股收益': '每股收益',
+                    '每股净资产': '每股净资产'
+                }
+                
+                for key, display_name in financial_metrics.items():
+                    if key in indicators:
+                        value = indicators[key]
+                        if value > 1e8:  # 大额数据转换为亿元
+                            report += f"  {display_name}: {value/1e8:.2f} 亿元\n"
+                        elif value > 1e4:  # 中等数据转换为万元
+                            report += f"  {display_name}: {value/1e4:.2f} 万元\n"
+                        else:
+                            report += f"  {display_name}: {value:.2f} 元\n"
+            
+            realtime_data = self.financial_data.get('realtime')
+            if realtime_data is not None:
+                report += f"  最新涨跌幅: {realtime_data.get('涨跌幅', 'N/A')}\n"
+                report += f"  成交量: {realtime_data.get('成交量', 'N/A')}\n"
+        
+        report += """
+💡【估值方法说明】
 1. DCF估值: 基于未来现金流折现的内在价值计算
 2. 相对估值: 基于市盈率、市净率等相对指标
 3. 资产基础估值: 基于公司净资产价值
 4. 蒙特卡洛模拟: 基于随机过程的概率分布分析
 5. 股利贴现模型: 基于未来股息折现的估值方法
 
-📈 估值结果汇总:
+📈【估值结果汇总】
 """
         
         current_price = None
@@ -622,6 +794,19 @@ class CompleteValuationSystem:
                 report += f"  内在价值: {intrinsic_value:.2f} 元\n"
             
             report += "\n"
+        
+        # 添加风险分析结果
+        if '风险分析' in self.valuation_results:
+            risk_result = self.valuation_results['风险分析']
+            report += "📊【风险分析结果】\n"
+            report += f"  年化收益率: {risk_result.get('年化收益率', 0)*100:.2f}%\n"
+            report += f"  年化波动率: {risk_result.get('年化波动率', 0)*100:.2f}%\n"
+            report += f"  夏普比率: {risk_result.get('夏普比率', 0):.2f}\n"
+            report += f"  最大回撤: {abs(risk_result.get('最大回撤', 0))*100:.2f}%\n"
+            report += f"  卡玛比率: {risk_result.get('卡玛比率', 0):.2f}\n"
+            report += f"  索提诺比率: {risk_result.get('索提诺比率', 0):.2f}\n"
+            report += f"  信息比率: {risk_result.get('信息比率', 0):.2f}\n"
+            report += f"  95%VaR: {risk_result.get('95%VaR', 0)*100:.2f}%\n"
         
         self.analysis_report = report
     
@@ -745,8 +930,53 @@ class CompleteValuationSystem:
             logger.error(f"图表生成失败: {e}")
             print(f"❌ 图表生成失败: {e}")
     
-    def save_report(self, filename=None):
-        """保存分析报告到文件"""
+    def _cleanup_old_files(self):
+        """清理旧的估值文件，只保留最近3个图表和报告"""
+        try:
+            logger.info("开始清理旧的估值文件")
+            
+            # 查找所有估值图表文件
+            chart_pattern = "估值图表_*.png"
+            report_pattern = "估值报告_*.txt"
+            
+            chart_files = glob.glob(chart_pattern)
+            report_files = glob.glob(report_pattern)
+            
+            # 按修改时间排序，最新的在前面
+            chart_files.sort(key=os.path.getmtime, reverse=True)
+            report_files.sort(key=os.path.getmtime, reverse=True)
+            
+            # 保留最近3个文件，删除其他的
+            files_to_keep = 3
+            
+            # 删除旧的图表文件
+            for old_chart in chart_files[files_to_keep:]:
+                try:
+                    os.remove(old_chart)
+                    logger.info(f"删除旧图表文件: {old_chart}")
+                except Exception as e:
+                    logger.warning(f"删除图表文件失败 {old_chart}: {e}")
+            
+            # 删除旧的报告文件
+            for old_report in report_files[files_to_keep:]:
+                try:
+                    os.remove(old_report)
+                    logger.info(f"删除旧报告文件: {old_report}")
+                except Exception as e:
+                    logger.warning(f"删除报告文件失败 {old_report}: {e}")
+            
+            logger.info(f"文件清理完成，保留最近 {files_to_keep} 个图表和报告文件")
+            
+        except Exception as e:
+            logger.error(f"文件清理失败: {e}")
+
+    def save_report(self, filename=None, cleanup=True):
+        """保存分析报告到文件
+        
+        参数:
+            filename: 文件名，如果为None则自动生成
+            cleanup: 是否清理旧文件，批量分析时设为False
+        """
         if filename is None:
             # 使用公司名称作为文件名的一部分，但移除特殊字符
             safe_company_name = "".join(c for c in self.company_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
@@ -756,22 +986,21 @@ class CompleteValuationSystem:
             with open(filename, 'w', encoding='utf-8') as f:
                 f.write(self.analysis_report)
             print(f"✅ 分析报告已保存到: {filename}")
+            
+            # 保存后清理旧文件（仅在单只股票分析时执行）
+            if cleanup:
+                self._cleanup_old_files()
+            
         except Exception as e:
             print(f"❌ 保存报告失败: {e}")
 
-def main():
-    """主函数"""
-    print("🚀 完整公司估值分析系统")
-    print("=" * 50)
-    print("包含多种估值方法、风险分析和可视化图表")
-    print("=" * 50)
+def analyze_single_stock(stock_code, cleanup=True):
+    """分析单只股票
     
-    # 用户输入股票代码
-    stock_code = input("请输入A股股票代码 (如600036): ").strip()
-    
-    if not stock_code:
-        stock_code = '600036'  # 默认分析招商银行
-    
+    参数:
+        stock_code: 股票代码
+        cleanup: 是否清理旧文件，批量分析时设为False
+    """
     print(f"\n📈 开始分析 {stock_code}...")
     
     # 创建分析器并执行分析
@@ -782,12 +1011,91 @@ def main():
         print(f"\n✅ {stock_code} 分析完成！")
         
         # 自动保存报告
-        analyzer.save_report()
+        analyzer.save_report(cleanup=cleanup)
         
-        print("\n📊 分析报告和图表已自动保存到当前目录")
+        return True
+    except Exception as e:
+        print(f"❌ {stock_code} 分析失败: {e}")
+        return False
+
+def analyze_batch_stocks(csv_file='a_share_leaders.csv'):
+    """批量分析股票"""
+    try:
+        # 读取CSV文件
+        leaders_df = pd.read_csv(csv_file, encoding='utf-8')
+        print(f"📋 读取到 {len(leaders_df)} 只龙头企业股票")
+        
+        success_count = 0
+        failed_stocks = []
+        
+        for index, row in leaders_df.iterrows():
+            stock_code = str(row['股票代码']).zfill(6)  # 确保6位代码
+            company_name = row['公司名称']
+            industry = row['行业']
+            
+            print(f"\n{'='*60}")
+            print(f"📊 分析第 {index+1}/{len(leaders_df)} 只股票: {company_name} ({stock_code})")
+            print(f"🏢 行业: {industry}")
+            print(f"{'='*60}")
+            
+            # 批量分析时不清理文件
+            if analyze_single_stock(stock_code, cleanup=False):
+                success_count += 1
+            else:
+                failed_stocks.append(f"{company_name}({stock_code})")
+            
+            # 添加延迟避免请求过于频繁
+            time.sleep(2)
+        
+        print(f"\n🎉 批量分析完成！")
+        print(f"✅ 成功分析: {success_count} 只股票")
+        if failed_stocks:
+            print(f"❌ 分析失败: {len(failed_stocks)} 只股票")
+            print("失败股票列表:", ", ".join(failed_stocks))
         
     except Exception as e:
-        print(f"❌ 分析失败: {e}")
+        print(f"❌ 批量分析失败: {e}")
+
+def main():
+    """主函数"""
+    print("🚀 完整公司估值分析系统")
+    print("=" * 50)
+    print("包含多种估值方法、风险分析和可视化图表")
+    print("=" * 50)
+    
+    while True:
+        print("\n请选择分析模式:")
+        print("1. 单只股票分析")
+        print("2. 批量分析龙头企业")
+        print("3. 退出程序")
+        
+        choice = input("请输入选择 (1/2/3): ").strip()
+        
+        if choice == '1':
+            # 单只股票分析
+            stock_code = input("请输入A股股票代码 (如600036): ").strip()
+            
+            if not stock_code:
+                stock_code = '600036'  # 默认分析招商银行
+            
+            analyze_single_stock(stock_code, cleanup=True)
+            break
+            
+        elif choice == '2':
+            # 批量分析
+            csv_file = input("请输入龙头企业CSV文件路径 (默认: a_share_leaders.csv): ").strip()
+            if not csv_file:
+                csv_file = 'a_share_leaders.csv'
+            
+            analyze_batch_stocks(csv_file)
+            break
+            
+        elif choice == '3':
+            print("👋 程序退出")
+            return
+            
+        else:
+            print("❌ 无效选择，请重新输入")
     
     print("\n🎉 程序运行完成！")
 
